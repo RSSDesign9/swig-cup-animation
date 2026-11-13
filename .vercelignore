@@ -1,0 +1,6 @@
+# only the live page ships: swig-cup.html + sfx/
+*
+!swig-cup.html
+!sfx
+!sfx/**
+!vercel.json

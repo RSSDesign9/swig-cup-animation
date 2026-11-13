@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swig Cup Spin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Pacifico&family=IBM+Plex+Mono:wght@500;600&family=Instrument+Sans:wght@500;600&display=block" rel="stylesheet">
+<style>
+  :root {
+    --swig-red: #E1322B;
+    --swig-red-deep: #A91C17;
+    --off-white: #FBF6EE;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--swig-red-deep); }
+  #stage { position: fixed; inset: 0; touch-action: manipulation; }
+  #stage canvas { position: absolute; inset: 0; display: block; }
+  #hint {
+    position: fixed; left: 50%; bottom: 52px; transform: translateX(-50%);
+    font: 500 13px/1 "Instrument Sans", system-ui, sans-serif; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--off-white); opacity: 0; transition: opacity .8s ease; pointer-events: none; white-space: nowrap;
+  }
+  #hint.show { opacity: .75; }
+  #sound {
+    position: fixed; right: 20px; bottom: 20px; width: 44px; height: 44px; padding: 0; border-radius: 50%;
+    display: grid; place-items: center; cursor: pointer; color: var(--off-white);
+    background: rgb(251 246 238 / .12); border: 1px solid rgb(251 246 238 / .35); backdrop-filter: blur(6px);
+    opacity: .7; transition: opacity .2s ease, background .2s ease;
+  }
+  #sound:hover, #sound:focus-visible { opacity: 1; background: rgb(251 246 238 / .2); }
+  #sound:focus-visible { outline: 2px solid var(--off-white); outline-offset: 3px; }
+  #sound svg { width: 20px; height: 20px; }
+  #sound .waves { display: none; }
+  #sound[aria-pressed="true"] .waves { display: inline; }
+  #sound[aria-pressed="true"] .mute { display: none; }
+  body.capture #hint, body.capture #sound { display: none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="bg"></canvas>
+  <canvas id="gl"></canvas>
+  <canvas id="fx"></canvas>
+</div>
+<div id="hint">Tap the cup for a refill</div>
+<button id="sound" type="button" aria-pressed="false" aria-label="Sound off">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M4 9.5h3.2L12 5.5v13l-4.8-4H4z" fill="currentColor" stroke="none"/>
+    <path class="waves" d="M15.5 9a4 4 0 0 1 0 6M18.2 6.5a7.5 7.5 0 0 1 0 11"/>
+    <path class="mute" d="M16 9.5l5 5M21 9.5l-5 5"/>
+  </svg>
+</button>
+<script src="sfx/swig-sfx.js"></script>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// ───────────────────────────────── config
+const qs = new URLSearchParams(location.search);
+const CAPTURE = qs.has('capture');
+const HANDLE = (qs.get('handle') || 'RSS DESIGN').toUpperCase();
+const LOOP = 8;                 // seconds per full turn; everything periodic divides this
+const SPIN_ZERO = 1.6;          // logo faces camera at 1.6 (+8k), the back logo + order sticker at 5.6
+const ANTICIPATE = 0.35;        // squash before each pop
+const TORRENT = { dur: 2.4, anticipate: 0.6 };
+// timeline: 'calm' = two pops per turn; 'torrent' (the video cut) adds a second turn whose logo pass erupts
+const SEQ = qs.get('seq') || (CAPTURE ? 'torrent' : 'calm');
+const PERIOD = SEQ === 'torrent' ? 16 : 8;
+const SCHEDULE = [{ s: 1.6, type: 'pop' }, { s: 5.6, type: 'pop' }, ...(SEQ === 'torrent' ? [{ s: 9.6, type: 'torrent' }] : [])];
+const START = 0.8;              // live page starts here so the first spurt lands fast
+const G = 14;                   // gravity, world units / s²
+const BRAND = {
+  red: '#E1322B', redDeep: '#A91C17', offWhite: '#FBF6EE',
+  cola: ['#3a0e0a', '#4b140d', '#2b0806', '#5c1c10'],
+  foam: ['#dcbb96', '#e8d2b5', '#c99e74'],
+};
+if (CAPTURE) document.body.classList.add('capture');
+
+// ───────────────────────────────── utils
+function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp01 = x => Math.min(1, Math.max(0, x));
+const easeOutCubic = x => 1 - Math.pow(1 - x, 3);
+const easeInOutCubic = x => x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+const smooth = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const TAU = Math.PI * 2;
+function canvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
+// ───────────────────────────────── renderer / scene
+const bgCanvas = document.getElementById('bg');
+const glCanvas = document.getElementById('gl');
+const fxCanvas = document.getElementById('fx');
+const bg = bgCanvas.getContext('2d');
+const fx = fxCanvas.getContext('2d');
+
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setClearColor(0x000000, 0);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.VSMShadowMap;
+
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.5;
+
+const BASE_FOV = +qs.get('fov') || 30;              // ?fov=&ty= reframe for other crops (e.g. portfolio thumbnails)
+const camera = new THREE.PerspectiveCamera(BASE_FOV, 1, 0.1, 100);
+const CAM_TY = +qs.get('ty') || 3.75;
+const CAM_POS = new THREE.Vector3(0, CAM_TY + .95, 18.2);
+const CAM_TARGET = new THREE.Vector3(0, CAM_TY, 0);
+camera.position.copy(CAM_POS); camera.lookAt(CAM_TARGET);
+
+// light: warm key from above-left, peach rim from behind-right, red bounce from the floor
+scene.add(new THREE.HemisphereLight(0xfff4ec, 0xe1322b, 0.95));
+const key = new THREE.DirectionalLight(0xfff1e6, 2.3);
+key.position.set(-4.5, 12, 5);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+Object.assign(key.shadow.camera, { left: -7, right: 7, top: 7, bottom: -7, near: 1, far: 30 });
+key.shadow.radius = 16; key.shadow.blurSamples = 24; key.shadow.bias = -0.0004;
+scene.add(key);
+const rim = new THREE.DirectionalLight(0xffd3c0, 1.7); rim.position.set(7, 5, -6); scene.add(rim);
+const fill = new THREE.DirectionalLight(0xffe9df, 0.45); fill.position.set(7, 2, 9); scene.add(fill);
+
+// floor: invisible, only catches shadows so the gradient stays the hero
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.ShadowMaterial({ color: 0x5e0c09, opacity: 0.42 }));
+floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; scene.add(floor);
+
+// contact blob under the floating cup
+const blobTex = (() => { const c = canvas(256, 256), g = c.getContext('2d'); const gr = g.createRadialGradient(128, 128, 0, 128, 128, 128); gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(.45, 'rgba(255,255,255,.45)'); gr.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = gr; g.fillRect(0, 0, 256, 256); return new THREE.CanvasTexture(c); })();
+const blob = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: blobTex, color: 0x4a0806, transparent: true, depthWrite: false, opacity: .35 }));
+blob.rotation.x = -Math.PI / 2; blob.position.y = 0.002; scene.add(blob);
+
+// ───────────────────────────────── cup geometry (32 oz Swig: tapered body, cup-holder step, rolled lip)
+const H = 3.7;
+const profileRaw = [
+  [0.0, 0.0], [0.50, 0.0], [0.572, 0.010], [0.597, 0.040], [0.604, 0.09],
+  [0.662, 0.90], [0.678, 0.948], [0.735, 0.995], [0.757, 1.035], [0.766, 1.09],
+  [0.995, H - 0.12], [1.010, H - 0.092], [1.040, H - 0.066], [1.056, H - 0.034], [1.048, H - 0.006], [1.022, H + 0.002], [0.992, H - 0.012], [0.985, H - 0.08],
+];
+// resample by arc length so texture v is undistorted
+const profile = (() => {
+  const seg = []; let L = 0;
+  for (let i = 1; i < profileRaw.length; i++) { const [x0, y0] = profileRaw[i - 1], [x1, y1] = profileRaw[i]; const l = Math.hypot(x1 - x0, y1 - y0); seg.push({ x0, y0, x1, y1, l, s: L }); L += l; }
+  const N = 320, pts = [];
+  for (let i = 0; i <= N; i++) {
+    const s = L * i / N; const sg = seg.find(q => s <= q.s + q.l + 1e-9) || seg[seg.length - 1]; const k = (s - sg.s) / sg.l;
+    pts.push({ r: sg.x0 + (sg.x1 - sg.x0) * k, y: sg.y0 + (sg.y1 - sg.y0) * k, s });
+  }
+  return { pts, L };
+})();
+function sAtY(y) { // arc length on the outer wall at height y
+  const p = profile.pts; for (let i = 1; i < p.length; i++) if (p[i].y >= y && p[i - 1].y < y && p[i].r > 0.6) { const k = (y - p[i - 1].y) / (p[i].y - p[i - 1].y); return { s: p[i - 1].s + (p[i].s - p[i - 1].s) * k, r: p[i - 1].r + (p[i].r - p[i - 1].r) * k }; }
+}
+
+// ───────────────────────────────── textures
+function makeBeadTexture() { // expanded-polystyrene beads, used as a bump map
+  const S = 1024, c = canvas(S, S), g = c.getContext('2d'), rnd = mulberry32(3);
+  g.fillStyle = '#585858'; g.fillRect(0, 0, S, S);
+  for (let i = 0; i < 5400; i++) {
+    const x = rnd() * S, y = rnd() * S, r = 7 + rnd() * 4.5;
+    for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) {
+      const X = x + ox, Y = y + oy; if (X < -r || X > S + r || Y < -r || Y > S + r) continue;
+      const gr = g.createRadialGradient(X - r * .25, Y - r * .25, r * .1, X, Y, r);
+      gr.addColorStop(0, '#f4f4f4'); gr.addColorStop(.7, '#b8b8b8'); gr.addColorStop(1, '#6a6a6a');
+      g.fillStyle = gr; g.beginPath(); g.arc(X, Y, r, 0, TAU); g.fill();
+    }
+  }
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(3, 2.4); t.colorSpace = THREE.NoColorSpace; return t;
+}
+
+function makeLogo() {
+  const S = 1400, c = canvas(S, S), g = c.getContext('2d'), cx = S / 2, cy = S / 2, R = S / 2 - 6;
+  g.fillStyle = BRAND.red; g.beginPath(); g.arc(cx, cy, R, 0, TAU); g.fill();
+  // printed-on-foam speckle
+  g.save(); g.beginPath(); g.arc(cx, cy, R, 0, TAU); g.clip();
+  const rnd = mulberry32(7);
+  for (let i = 0; i < 14000; i++) { g.fillStyle = rnd() < .55 ? 'rgba(255,255,255,0.07)' : 'rgba(80,0,0,0.08)'; g.beginPath(); g.arc(rnd() * S, rnd() * S, .8 + rnd() * 2.4, 0, TAU); g.fill(); }
+  g.restore();
+  // thin inner ring across the top
+  g.strokeStyle = '#fff'; g.lineWidth = S * 0.017; g.lineCap = 'round';
+  g.beginPath(); g.arc(cx, cy, R * 0.875, Math.PI * 1.14, Math.PI * 1.86); g.stroke();
+  // wordmark
+  let fs = 500; g.font = `400 ${fs}px Pacifico`; fs *= (S * 0.80) / g.measureText('Swig').width; g.font = `400 ${fs}px Pacifico`;
+  g.save(); g.translate(cx, cy); g.rotate(-0.06);
+  g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+  g.fillText('Swig', -S * 0.005, fs * 0.22);
+  g.font = `600 ${S * 0.04}px "Instrument Sans"`; g.textAlign = 'left'; g.fillText('™', S * 0.41, -fs * 0.06);
+  g.restore();
+  return c;
+}
+
+function makeSticker() { // thermal-printed order label, like the real ones
+  const w = 900, h = 400, c = canvas(w, h), g = c.getContext('2d');
+  g.fillStyle = '#fbfbf7'; g.beginPath(); g.roundRect(4, 4, w - 8, h - 8, 14); g.fill();
+  g.strokeStyle = 'rgba(0,0,0,0.10)'; g.lineWidth = 3; g.stroke();
+  g.fillStyle = '#262626'; g.textBaseline = 'alphabetic';
+  g.font = '500 46px "IBM Plex Mono"'; g.fillText('Order 100832', 48, 112);
+  g.textAlign = 'right'; g.fillText('08:08', w - 48, 112); g.textAlign = 'left';
+  g.font = '600 62px "IBM Plex Mono"'; g.fillText('Diet Dr Pepper, 32oz', 48, 228);
+  g.font = '500 46px "IBM Plex Mono"'; g.fillText(HANDLE.length > 22 ? HANDLE.slice(0, 22) : HANDLE, 48, 330);
+  return c;
+}
+
+function makeCupTexture() {
+  const Wt = 3072, Ht = 2304, c = canvas(Wt, Ht), g = c.getContext('2d'), L = profile.L;
+  g.fillStyle = '#ffffff'; g.fillRect(0, 0, Wt, Ht);
+  const place = (img, u, y, wU, hU, rot = 0) => {
+    const { s, r } = sAtY(y), cy = (1 - s / L) * Ht, w = wU * Wt / (TAU * r), h = hU * Ht / L;
+    for (const off of [-Wt, 0, Wt]) { g.save(); g.translate(u * Wt + off, cy); g.rotate(rot); g.drawImage(img, -w / 2, -h / 2, w, h); g.restore(); }
+  };
+  // a roundel on both faces; the order label is slapped on below the back one, a touch crooked like the real thing
+  const logo = makeLogo();
+  place(logo, 0, 2.4, 1.46, 1.46);
+  place(logo, 0.5, 2.4, 1.46, 1.46);
+  place(makeSticker(), 0.5, 1.4, 1.16, 1.16 * 400 / 900, -0.035);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = renderer.capabilities.getMaxAnisotropy(); return t;
+}
+
+// ───────────────────────────────── cup assembly
+const rig = new THREE.Group();     // float / bob
+const tilt = new THREE.Group();    // the tilted axis
+const squash = new THREE.Group();  // squash & stretch, pivots at the base
+const spin = new THREE.Group();    // the slow turn
+scene.add(rig); rig.add(tilt); tilt.add(squash); squash.add(spin);
+squash.position.y = -H / 2;
+const CY = 0.78 + H / 2;
+
+let cupMat, lid, strawGroup; const hitTargets = [];
+const STRAW_R = 0.072, STRAW_UP = 1.5, STRAW_DOWN = 3.2, STRAW_LEAN = -0.2;
+
+function buildCup() {
+  cupMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, map: makeCupTexture(), bumpMap: makeBeadTexture(), bumpScale: 0.9, roughness: 0.8, sheen: 0.35, sheenRoughness: 0.7, sheenColor: 0xffffff });
+  const cup = new THREE.Mesh(new THREE.LatheGeometry(profile.pts.map(p => new THREE.Vector2(p.r, p.y)), 180), cupMat);
+  cup.castShadow = true; spin.add(cup); hitTargets.push(cup);
+
+  // pebble-ice-dark liquid under a translucent lid
+  const liquid = new THREE.Mesh(new THREE.CircleGeometry(0.985, 72), new THREE.MeshStandardMaterial({ color: 0x240806, roughness: 0.25 }));
+  liquid.rotation.x = -Math.PI / 2; liquid.position.y = H - 0.13; spin.add(liquid);
+
+  const lidRaw = [[1.060, H - 0.118], [1.078, H - 0.10], [1.083, H - 0.02], [1.079, H + 0.03], [1.062, H + 0.056], [1.032, H + 0.063], [0.992, H + 0.051], [0.93, H + 0.046], [0.70, H + 0.046], [0.672, H + 0.07], [0.60, H + 0.077], [0.565, H + 0.05], [0.0, H + 0.05]];
+  lid = new THREE.Group(); spin.add(lid);
+  const lidMat = new THREE.MeshPhysicalMaterial({ color: 0xf6f2ec, roughness: 0.32, transmission: 0.45, thickness: 0.08, ior: 1.45, clearcoat: 0.7, clearcoatRoughness: 0.18, side: THREE.DoubleSide });
+  const lidMesh = new THREE.Mesh(new THREE.LatheGeometry(lidRaw.map(([r, y]) => new THREE.Vector2(r, y)), 160), lidMat);
+  lidMesh.castShadow = true; lid.add(lidMesh); hitTargets.push(lidMesh);
+
+  // red straw
+  strawGroup = new THREE.Group(); strawGroup.position.set(0.30, H + 0.05, 0); strawGroup.rotation.set(0.04, 0, STRAW_LEAN); spin.add(strawGroup);
+  const strawMat = new THREE.MeshPhysicalMaterial({ color: 0xd8241d, roughness: 0.26, clearcoat: 0.9, clearcoatRoughness: 0.12, side: THREE.DoubleSide });
+  const tube = new THREE.Mesh(new THREE.CylinderGeometry(STRAW_R, STRAW_R, STRAW_UP + STRAW_DOWN, 48, 1, true), strawMat);
+  tube.position.y = (STRAW_UP - STRAW_DOWN) / 2; tube.castShadow = true; strawGroup.add(tube);
+  const inner = new THREE.Mesh(new THREE.CylinderGeometry(STRAW_R * .8, STRAW_R * .8, 0.6, 32, 1, true), new THREE.MeshStandardMaterial({ color: 0x3a0605, roughness: .6, side: THREE.BackSide }));
+  inner.position.y = STRAW_UP - 0.3; strawGroup.add(inner);
+  const lip = new THREE.Mesh(new THREE.RingGeometry(STRAW_R * .8, STRAW_R, 48), strawMat);
+  lip.rotation.x = -Math.PI / 2; lip.position.y = STRAW_UP; strawGroup.add(lip);
+}
+
+// ───────────────────────────────── liquid: a coherent jet that beads up and breaks into droplets, plus spray and fizz
+const MAX = 7000;
+const dropGeo = new THREE.SphereGeometry(1, 16, 12);
+const colaMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, envMapIntensity: 1.8, roughness: 0.06, clearcoat: 1, clearcoatRoughness: 0.04, specularIntensity: 1 });
+const jetMat = new THREE.MeshPhysicalMaterial({ color: 0x4a120c, envMapIntensity: 2.2, roughness: 0.05, clearcoat: 1, clearcoatRoughness: 0.03, specularIntensity: 1, side: THREE.DoubleSide });
+const foamMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.55 });
+const drops = new THREE.InstancedMesh(dropGeo, colaMat, MAX);
+const foams = new THREE.InstancedMesh(dropGeo, foamMat, MAX);
+const splatMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35, envMapIntensity: 0.5 });
+const splats = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 24), splatMat, MAX);
+for (const m of [drops, foams, splats]) { m.frustumCulled = false; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); m.count = 0; m.setColorAt(0, new THREE.Color()); scene.add(m); }
+drops.castShadow = true;
+const colaCols = BRAND.cola.map(c => new THREE.Color(c));
+const foamCols = BRAND.foam.map(c => new THREE.Color(c));
+
+// jet tubes: a small pool of dynamic tube meshes rebuilt every frame from the core particle chain
+const RING = 80, SIDES = 14, POOL = 24;
+const tubes = Array.from({ length: POOL }, () => {
+  const g = new THREE.BufferGeometry(), idx = [];
+  for (let j = 0; j < RING - 1; j++) for (let k = 0; k < SIDES; k++) {
+    const a = j * SIDES + k, b = j * SIDES + (k + 1) % SIDES, c = a + SIDES, d = b + SIDES; idx.push(a, b, c, b, d, c);
+  }
+  g.setIndex(idx);
+  for (const n of ['position', 'normal']) { const at = new THREE.BufferAttribute(new Float32Array(RING * SIDES * 3), 3); at.setUsage(THREE.DynamicDrawUsage); g.setAttribute(n, at); }
+  const m = new THREE.Mesh(g, jetMat); m.frustumCulled = false; m.castShadow = true; m.visible = false; scene.add(m); return m;
+});
+const _c = new THREE.Vector3(), _tg = new THREE.Vector3(), _n1 = new THREE.Vector3(), _n2 = new THREE.Vector3(), _ref = new THREE.Vector3(0, 0, 1), _dir = new THREE.Vector3();
+function setTube(mesh, pts, tes, r0, attached) {
+  const n = pts.length, P = mesh.geometry.attributes.position.array, Nn = mesh.geometry.attributes.normal.array;
+  for (let j = 0; j < RING; j++) {
+    const q = j / (RING - 1), f = q * (n - 1), i0 = Math.min(n - 2, Math.floor(f)), k = f - i0;
+    _c.lerpVectors(pts[i0], pts[i0 + 1], k);
+    _tg.subVectors(pts[i0 + 1], pts[i0]).normalize();
+    _n1.crossVectors(_ref, _tg); if (_n1.lengthSq() < 1e-6) _n1.set(1, 0, 0); _n1.normalize(); _n2.crossVectors(_tg, _n1);
+    const te = tes[i0] + (tes[i0 + 1] - tes[i0]) * k;
+    const ends = (attached ? 1 : Math.sqrt(clamp01(f / 1.6))) * Math.sqrt(clamp01((n - 1 - f) / 1.6));
+    const bead = 1 + 0.30 * smooth(0.15, 1, q) * Math.sin(TAU * te / 0.034);   // Plateau–Rayleigh necking
+    const r = r0 * Math.max(0.12, ends) * bead * (1 + 0.25 * q);
+    for (let s = 0; s < SIDES; s++) {
+      const a = s / SIDES * TAU, o = (j * SIDES + s) * 3;
+      _dir.copy(_n1).multiplyScalar(Math.cos(a)).addScaledVector(_n2, Math.sin(a));
+      P[o] = _c.x + _dir.x * r; P[o + 1] = _c.y + _dir.y * r; P[o + 2] = _c.z + _dir.z * r;
+      Nn[o] = _dir.x; Nn[o + 1] = _dir.y; Nn[o + 2] = _dir.z;
+    }
+  }
+  mesh.geometry.attributes.position.needsUpdate = true; mesh.geometry.attributes.normal.needsUpdate = true;
+  mesh.visible = true;
+}
+
+const extraSpurts = []; // taps on the live page
+function eventsNear(t) {   // scheduled + tapped events around t: { s, seed, type }
+  const out = [], k0 = Math.floor(t / PERIOD);
+  for (let k = k0 - 1; k <= k0 + 1; k++) SCHEDULE.forEach((e, i) => out.push({ s: e.s + k * PERIOD, seed: 101 + i * 977, type: e.type }));
+  out.push(...extraSpurts);
+  const torr = out.filter(e => e.type === 'torrent');   // a torrent swallows any pop scheduled around it
+  return out.filter(e => e.type === 'torrent' || !torr.some(T => e.s > T.s - TORRENT.anticipate - 1 && e.s < T.s + TORRENT.dur + 1.2));
+}
+function torrentFx(t) {
+  let env = 0, ant = 0, ra = 9;
+  for (const e of eventsNear(t)) {
+    if (e.type !== 'torrent') continue;
+    const r = t - e.s;
+    if (r > -TORRENT.anticipate && r < 0) ant = Math.max(ant, easeInOutCubic(1 + r / TORRENT.anticipate));
+    else if (r >= 0 && r < .14) ant = Math.max(ant, 1 - easeOutCubic(r / .14));
+    if (r >= 0 && r < TORRENT.dur + 2) {
+      env = Math.max(env, smooth(0, .12, r) * (1 - smooth(TORRENT.dur - .45, TORRENT.dur, r)));
+      if (r > TORRENT.dur) ra = Math.min(ra, r - TORRENT.dur);
+    }
+  }
+  return { env, ant, ra, shake: ant * .7 + env };
+}
+
+// cup pose: the slow turn plus the torrent's thrust; pops add their bounce on top in applyScene
+function applyBase(t) {
+  const ph = TAU * t / LOOP, T = torrentFx(t);
+  const rebound = T.ra < 9 ? .07 * Math.sin(9 * T.ra) * Math.exp(-4 * T.ra) : 0;
+  rig.position.set(0, CY + 0.11 * Math.sin(2 * ph) - .05 * T.ant - .2 * T.env + rebound, 0);   // thrust shoves the cup down
+  tilt.rotation.set(0.15 + 0.03 * Math.sin(ph) + T.shake * .011 * Math.sin(t * 83), 0, -0.05 + 0.02 * Math.cos(ph) + T.shake * .011 * Math.sin(t * 71 + 1.3));
+  spin.rotation.y = TAU * (t - SPIN_ZERO) / LOOP;
+  const sq = .06 * T.ant + .03 * T.env;
+  squash.scale.set(1 + sq * .5, 1 - sq, 1 + sq * .5);
+  strawGroup.rotation.z = STRAW_LEAN + T.shake * .03 * Math.sin(t * 61); strawGroup.rotation.x = 0.04 + T.shake * .02 * Math.sin(t * 53);
+  lid.position.y = T.env * (.03 + .01 * Math.sin(t * 97));
+}
+
+const _p = new THREE.Vector3(), _d = new THREE.Vector3(), _q = new THREE.Quaternion(), _a = new THREE.Vector3(), _b = new THREE.Vector3(), _top = new THREE.Vector3(), UP = new THREE.Vector3(0, 1, 0);
+function strawAt(t) {
+  applyBase(t); rig.updateMatrixWorld(true);
+  strawGroup.localToWorld(_p.set(0, STRAW_UP, 0));
+  strawGroup.getWorldQuaternion(_q); _d.set(0, 1, 0).applyQuaternion(_q);
+  spin.localToWorld(_top.set(0, H, 0));
+  return { p: _p.clone(), d: _d.clone(), top: _top.clone() };
+}
+
+function valueNoise(rnd, n, period) { const k = Array.from({ length: Math.ceil(n / period) + 2 }, rnd); return i => { const f = i / period, i0 = Math.floor(f), t = f - i0, s = t * t * (3 - 2 * t); return k[i0] + (k[i0 + 1] - k[i0]) * s; }; }
+
+const KINDS = {
+  pop: {
+    D: .62, R: .058, NC: 180, NS: 260, tail: .12, up: .26, out: .11, sway: 0, main: .064, sat: .024, foam: .22, sprayR: .026, cone: [.06, .16],
+    speed: (te, i) => 6.7 * (1 - .36 * te / .62) * (1 + .02 * Math.sin(i * .7)),
+    tb: (i, b, prog) => (i < 7 ? .05 + i * .012 : .15 + .22 * b) * (1 - .3 * prog),
+    spray: (te, prog, r) => (5.0 + r * 1.9) * (1 - .45 * prog),
+  },
+  torrent: {   // rockets out of frame, sways like a fire hose, rains back down
+    D: TORRENT.dur, R: .08, NC: 640, NS: 1700, tail: .2, up: .52, out: .05, sway: .1, main: .092, sat: .032, foam: .3, sprayR: .036, cone: [.09, .08],
+    speed: te => 10.6 * (.6 + .4 * smooth(0, .14, te)) * (1 + .07 * Math.sin(TAU * 2.1 * te) + .04 * Math.sin(TAU * 5.3 * te)) * (1 - .55 * smooth(TORRENT.dur - .5, TORRENT.dur, te)),
+    tb: (i, b) => i < 10 ? .06 + i * .015 : .24 + .34 * b,
+    spray: (te, prog, r) => KINDS.torrent.speed(te) * (.55 + .4 * r),
+  },
+};
+const spurtCache = new Map();
+function getSpurt(e) {
+  const key = e.type + e.s.toFixed(4); if (spurtCache.has(key)) return spurtCache.get(key);
+  const K = KINDS[e.type], s = e.s, rnd = mulberry32(e.seed), core = [], loose = [];
+  const tip0 = strawAt(s).p;
+  const finish = (d, top) => {   // landing on the floor (or into the lid)
+    const tFloor = (d.v.y + Math.sqrt(d.v.y * d.v.y + 2 * G * (d.p.y - d.r))) / G;
+    const yTop = top.y + .1, tLid = (d.v.y + Math.sqrt(Math.max(0, d.v.y * d.v.y + 2 * G * (d.p.y - yTop)))) / G;
+    const onLid = Math.hypot(d.p.x + d.v.x * tLid - top.x, d.p.z + d.v.z * tLid - top.z) < 1.18;
+    d.tEnd = d.t0 + (onLid ? tLid : tFloor); d.splat = !onLid && !d.foam;
+    d.sx = d.p.x + d.v.x * tFloor; d.sz = d.p.z + d.v.z * tFloor; d.sr = 1.5 + rnd() * .9;
+    d.crown = d.splat && d.r > .03 ? Array.from({ length: 3 }, (_, k) => { const a = (k / 3 + rnd() * .2) * TAU, sp = .8 + rnd() * 1.1; return new THREE.Vector3(Math.cos(a) * sp * .55, 1.4 + rnd() * 1.2, Math.sin(a) * sp * .55); }) : null;
+    d.col = Math.floor(rnd() * (d.foam ? foamCols.length : colaCols.length));
+  };
+  // depth is invisible to the viewer, so keep the arc in the picture plane (and slightly behind the cup)
+  const emitDir = (d, p, top, te) => {
+    const e = d.clone(), o = new THREE.Vector3(p.x - top.x, 0, 0);
+    e.addScaledVector(o.normalize(), K.out);
+    e.x += K.sway * Math.sin(TAU * 1.1 * te); e.z += K.sway * .4 * Math.sin(TAU * .7 * te + 1);
+    e.z = e.z * .25 - .05; return e.normalize().lerp(UP, K.up).normalize();
+  };
+  // core chain → jet column
+  const brk = valueNoise(rnd, K.NC, 11);
+  for (let i = 0; i < K.NC; i++) {
+    const te = K.D * i / (K.NC - 1), prog = te / K.D, { p, d, top } = strawAt(s + te);
+    const v = emitDir(d, p, top, te).multiplyScalar(K.speed(te, i)), p0 = p.clone().addScaledVector(d, -0.05);
+    const tb = K.tb(i, brk(i), prog);   // when this slice beads off
+    const kick = new THREE.Vector3(rnd() - .5, rnd() - .5, rnd() - .5).multiplyScalar(0.4);
+    // Rayleigh pattern: a main drop every 4th slice with a satellite between; the rest merge away
+    const fade = .55 + .45 * (1 - smooth(K.D - .5, K.D, te));   // drops thin out as the pressure dies
+    const kind = i % 4, c = { te, p0, v, tb, r: (kind === 0 ? K.main * (0.85 + rnd() * .35) : kind === 2 ? K.sat : 0) * fade, foam: false };
+    // as a free droplet: p(τ) = (p0 − kick·tb) + (v + kick)τ − ½gτ²
+    const dd = { p: p0.clone().addScaledVector(kick, -tb), v: v.clone().add(kick), r: c.r, foam: false, t0: 0 };
+    finish(dd, top); Object.assign(c, { dp: dd.p, dv: dd.v, tEnd: dd.tEnd, splat: dd.splat, sx: dd.sx, sz: dd.sz, sr: dd.sr, col: dd.col });
+    core.push(c);
+  }
+  // spray + fizz around the jet, sputtering a little past the main pulse
+  for (let i = 0; i < K.NS; i++) {
+    const te = (K.D + K.tail) * Math.pow(rnd(), 1.15), prog = clamp01(te / K.D), { p, d, top } = strawAt(s + te);
+    const foam = rnd() < K.foam;
+    const speed = K.spray(Math.min(te, K.D), prog, rnd()) * (foam ? .85 : 1);
+    const cone = (K.cone[0] + K.cone[1] * prog + (foam ? .08 : 0)) * Math.sqrt(-2 * Math.log(rnd() + 1e-6)) * .7;
+    const dir = emitDir(d, p, top, te);
+    _a.set(1, 0, 0); if (Math.abs(dir.x) > .9) _a.set(0, 0, 1); _a.cross(dir).normalize(); _b.copy(dir).cross(_a);
+    const ang = rnd() * TAU;
+    const v = dir.addScaledVector(_a, Math.cos(ang) * cone).addScaledVector(_b, Math.sin(ang) * cone).normalize().multiplyScalar(speed);
+    const r = (0.01 + Math.pow(rnd(), 2) * K.sprayR) * (foam ? .8 : 1);
+    const dd = { te, p: p.clone().addScaledVector(d, 0.02), v, r, foam, t0: 0 };
+    finish(dd, top); loose.push(dd);
+  }
+  const sp = { s, type: e.type, R: K.R, core, loose, tip: tip0 };
+  spurtCache.set(key, sp); return sp;
+}
+
+function spurtsNear(t) {
+  return eventsNear(t).filter(e => {
+    const lead = e.type === 'torrent' ? TORRENT.anticipate : ANTICIPATE, life = e.type === 'torrent' ? TORRENT.dur + 4.5 : 4;
+    return t - e.s > -lead - .01 && t - e.s < life;
+  }).map(getSpurt);
+}
+
+const _m = new THREE.Matrix4(), _pos = new THREE.Vector3(), _scl = new THREE.Vector3(), _vel = new THREE.Vector3(), Y = new THREE.Vector3(0, 1, 0);
+
+function applyScene(t) {
+  const sps = spurtsNear(t);   // builds caches (moves the rig), so pose afterwards
+  applyBase(t);
+  let sy = 1, sxz = 1, jig = 0, pop = 0;
+  for (const sp of sps) {
+    if (sp.type !== 'pop') continue;
+    const a = t - (sp.s - ANTICIPATE);
+    if (a >= 0 && a < ANTICIPATE) { const k = easeInOutCubic(a / ANTICIPATE); sy -= .045 * k; sxz += .022 * k; jig -= .035 * k; }
+    const r = t - sp.s;
+    if (r >= 0 && r < 2) {
+      const d = Math.exp(-4.4 * r), c = Math.cos(17 * r);
+      sy += -.045 * c * d; sxz += .022 * c * d;
+      jig += -.035 * Math.cos(21 * r) * Math.exp(-3.4 * r) + .085 * Math.sin(21 * r) * Math.exp(-3.4 * r);
+      if (r < .2) pop += .032 * Math.sin(Math.PI * r / .2);
+    }
+  }
+  squash.scale.multiply(_scl.set(sxz, sy, sxz));
+  strawGroup.rotation.z += jig; strawGroup.rotation.x += jig * .4;
+  lid.position.y += pop;
+
+  // contact blob breathes with the bob
+  const lift = (rig.position.y - CY) / .11;
+  blob.scale.setScalar(2.9 + .25 * lift); blob.material.opacity = .30 - .07 * lift;
+
+  let nd = 0, nf = 0, ns = 0, nt = 0;
+  const putDrop = (pos, vel, r, d) => {
+    const spd = vel.length(); _vel.copy(vel).multiplyScalar(1 / spd);
+    _q.setFromUnitVectors(Y, _vel); _scl.set(r, r * (1 + Math.min(spd * .045, .8)), r);
+    _m.compose(pos, _q, _scl);
+    if (d.foam) { if (nf < MAX) { foams.setMatrixAt(nf, _m); foams.setColorAt(nf, foamCols[d.col]); nf++; } }
+    else if (nd < MAX) { drops.setMatrixAt(nd, _m); drops.setColorAt(nd, colaCols[d.col]); nd++; }
+  };
+  const putSplat = (d, sa) => {
+    if (sa > 1.1 || ns >= MAX || !d.splat) return;
+    if (d.crown && sa < .5) for (const cv of d.crown) {
+      const ty = sa; const y = .02 + cv.y * ty - .5 * G * ty * ty; if (y < 0) continue;
+      _pos.set(d.sx + cv.x * ty, y, d.sz + cv.z * ty); _vel.set(cv.x, cv.y - G * ty, cv.z);
+      putDrop(_pos.clone(), _vel.clone(), d.r * .32, d);
+    }
+    const R = d.r * d.sr * easeOutCubic(clamp01(sa / .07)) * (1 - Math.pow(clamp01((sa - .2) / .9), 1.6));
+    if (R <= 0) return;
+    _pos.set(d.sx, .004, d.sz); _q.identity(); _scl.set(R, .012, R);
+    _m.compose(_pos, _q, _scl); splats.setMatrixAt(ns, _m); splats.setColorAt(ns, colaCols[d.col]); ns++;
+  };
+  const ballistic = (p0, v, tau) => { _pos.copy(p0).addScaledVector(v, tau); _pos.y -= .5 * G * tau * tau; _vel.copy(v); _vel.y -= G * tau; };
+
+  for (const sp of sps) {
+    const base = t - sp.s; if (base < 0) continue;
+    // core: walk newest → oldest, gathering contiguous runs that are still a coherent column
+    let run = [], runTe = [], attached = false;
+    const flush = () => {
+      if (run.length >= 3 && nt < POOL) setTube(tubes[nt++], run, runTe, sp.R, attached);
+      else for (let i = 0; i < run.length; i++) { const c = run[i].c; ballistic(c.p0, c.v, base - c.te); putDrop(_pos.clone(), _vel.clone(), Math.max(c.r, sp.R), c); }
+      run = []; runTe = []; attached = false;
+    };
+    for (let i = sp.core.length - 1; i >= 0; i--) {
+      const c = sp.core[i], tau = base - c.te;
+      if (tau < 0) continue;
+      if (tau < c.tb) {
+        ballistic(c.p0, c.v, tau);
+        if (!run.length) attached = tau < 0.012;
+        const pt = _pos.clone(); pt.c = c; run.push(pt); runTe.push(c.te);
+        continue;
+      }
+      flush();
+      if (!c.r) continue;
+      if (tau < c.tEnd) { ballistic(c.dp, c.dv, tau); putDrop(_pos, _vel, c.r, c); }
+      else putSplat(c, tau - c.tEnd);
+    }
+    flush();
+    for (const d of sp.loose) {
+      const tau = base - d.te; if (tau < 0) continue;
+      if (tau < d.tEnd) { ballistic(d.p, d.v, tau); putDrop(_pos, _vel, d.r * Math.min(1, .4 + tau / .05), d); }
+      else putSplat(d, tau - d.tEnd);
+    }
+  }
+  for (let i = nt; i < POOL; i++) tubes[i].visible = false;
+  for (const [m, n] of [[drops, nd], [foams, nf], [splats, ns]]) { m.count = n; m.instanceMatrix.needsUpdate = true; if (m.instanceColor) m.instanceColor.needsUpdate = true; }
+  return sps;
+}
+
+// ───────────────────────────────── 2D layers: gradient field, roundel ripples, fizz, grain
+let W = 1080, Hh = 1350, DPR = 1, SC = 1;
+let bgStatic = null, bubbles = [];
+
+function buildStatic() {
+  const c = canvas(Math.round(W * DPR), Math.round(Hh * DPR)), g = c.getContext('2d');
+  g.scale(DPR, DPR);
+  // light lives where the liquid flies; the brand red is the ground the product stands on
+  const cx = W * .5, cy = Hh * .29, R = Math.hypot(Math.max(W * .5, Hh * .4), Hh * .71);
+  const gr = g.createRadialGradient(cx, cy, 0, cx, cy, R);
+  gr.addColorStop(0.00, '#FDFAF4');
+  gr.addColorStop(0.12, '#FBF3E9');
+  gr.addColorStop(0.27, '#F8D9C6');
+  gr.addColorStop(0.41, '#F3A688');
+  gr.addColorStop(0.55, '#EA6649');
+  gr.addColorStop(0.69, '#E1322B');
+  gr.addColorStop(0.86, '#C8251F');
+  gr.addColorStop(1.00, '#A21A15');
+  g.fillStyle = gr; g.fillRect(0, 0, W, Hh);
+  // sweep: the floor settles a touch deeper
+  const fl = g.createLinearGradient(0, Hh * .74, 0, Hh);
+  fl.addColorStop(0, 'rgba(120,12,8,0)'); fl.addColorStop(1, 'rgba(120,12,8,.22)');
+  g.fillStyle = fl; g.fillRect(0, 0, W, Hh);
+  // warm pool of light on the floor under the cup
+  g.save(); g.translate(W * .5, Hh * .865); g.scale(1, .28);
+  const pool = g.createRadialGradient(0, 0, 0, 0, 0, Hh * .32);
+  pool.addColorStop(0, 'rgba(255,170,140,.30)'); pool.addColorStop(1, 'rgba(255,170,140,0)');
+  g.fillStyle = pool; g.beginPath(); g.arc(0, 0, Hh * .32, 0, TAU); g.fill(); g.restore();
+  // film grain (static so it compresses cleanly)
+  const n = canvas(256, 256), ng = n.getContext('2d'), id = ng.createImageData(256, 256), rnd = mulberry32(11);
+  for (let i = 0; i < id.data.length; i += 4) { const v = 128 + (rnd() - .5) * 110; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; }
+  ng.putImageData(id, 0, 0);
+  g.globalCompositeOperation = 'overlay'; g.globalAlpha = .16; g.fillStyle = g.createPattern(n, 'repeat'); g.fillRect(0, 0, W, Hh);
+  g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1;
+  bgStatic = c;
+
+  // fizz: every bubble completes whole trips per loop so the video loops seamlessly
+  const rnd2 = mulberry32(21), count = Math.round(Math.min(90, Math.max(26, 38 * (W * Hh) / (1080 * 1350))));
+  bubbles = Array.from({ length: count }, () => {
+    const depth = rnd2();
+    return { x: rnd2(), y: rnd2(), r: (2.5 + depth * 9) * SC, trips: depth > .6 ? 2 : 1, amp: (4 + rnd2() * 14) * SC, wob: 1 + Math.floor(rnd2() * 3), ph: rnd2() * TAU, a: .35 + depth * .5 };
+  });
+}
+
+function project(v) { const p = v.clone().project(camera); return { x: (p.x + 1) / 2 * W, y: (1 - p.y) / 2 * Hh }; }
+
+function drawBackground(t, sps) {
+  const g = bg; g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.drawImage(bgStatic, 0, 0, W, Hh);
+  const ph = TAU * t / LOOP;
+
+  // pressure ripples: the roundel as motion language, released with every spurt
+  for (const sp of sps) for (let n = 0, pulses = sp.type === 'torrent' ? 7 : 1; n < pulses; n++) {
+    const age = t - sp.s - n * .38; if (age < 0 || age > 2.8) continue;
+    const o = project(sp.tip);
+    for (let j = 0; j < 2; j++) {
+      const a = age - j * .24; if (a <= 0 || a > 2.2) continue;
+      const p = a / 2.2, e = easeOutCubic(p);
+      g.lineWidth = (2.4 - 1.4 * p) * SC; g.strokeStyle = `rgba(255,246,236,${.42 * Math.pow(1 - p, 1.6) * (1 - j * .35)})`;
+      g.beginPath(); g.arc(o.x, o.y, Hh * (.03 + .62 * e), 0, TAU); g.stroke();
+    }
+  }
+
+  // fizz
+  for (const b of bubbles) {
+    const yn = ((b.y + b.trips * t / LOOP) % 1);
+    const y = Hh * (1.06 - yn * 1.12), x = b.x * W + b.amp * Math.sin(b.wob * ph + b.ph);
+    const a = b.a * smooth(.1, .22, yn) * (1 - smooth(.78, 1, yn));
+    if (a <= .01) continue;
+    g.fillStyle = `rgba(255,246,236,${a * .14})`; g.strokeStyle = `rgba(255,246,236,${a * .7})`; g.lineWidth = Math.max(1, b.r * .14);
+    g.beginPath(); g.arc(x, y, b.r, 0, TAU); g.fill(); g.stroke();
+    g.fillStyle = `rgba(255,255,255,${a * .9})`; g.beginPath(); g.arc(x - b.r * .38, y - b.r * .38, b.r * .2, 0, TAU); g.fill();
+  }
+}
+
+function drawOverlay() {
+  const g = fx; g.setTransform(DPR, 0, 0, DPR, 0, 0); g.clearRect(0, 0, W, Hh);
+  if (qs.get('sig') === '0') return;
+  const s = Math.max(.62, SC), pad = 60 * s, y = Hh - pad, fs = 19 * s;
+  g.font = `600 ${fs}px "Instrument Sans"`; g.letterSpacing = `${fs * .24}px`; g.textBaseline = 'alphabetic';
+  // mini roundel mark
+  g.strokeStyle = 'rgba(255,247,238,.92)'; g.lineWidth = 1.6 * s; g.beginPath(); g.arc(pad + 8 * s, y - fs * .36, 8 * s, 0, TAU); g.stroke();
+  g.fillStyle = 'rgba(255,247,238,.92)'; g.beginPath(); g.arc(pad + 8 * s, y - fs * .36, 3 * s, 0, TAU); g.fill();
+  g.textAlign = 'left'; g.fillText(HANDLE, pad + 26 * s, y);
+}
+
+// ───────────────────────────────── sizing + frame
+function resize() {
+  if (CAPTURE) { W = +qs.get('w') || 1080; Hh = +qs.get('h') || 1350; DPR = 1; }
+  else { W = innerWidth; Hh = innerHeight; DPR = Math.min(devicePixelRatio || 1, 2); }
+  SC = Hh / 1350 * Math.min(1, (W / Hh) / .8);
+  for (const c of [bgCanvas, fxCanvas]) { c.width = Math.round(W * DPR); c.height = Math.round(Hh * DPR); c.style.width = W + 'px'; c.style.height = Hh + 'px'; }
+  renderer.setPixelRatio(CAPTURE ? 2 : DPR); renderer.setSize(W, Hh);
+  const aspect = W / Hh; camera.aspect = aspect;
+  camera.fov = aspect < .8 ? 2 * THREE.MathUtils.radToDeg(Math.atan(Math.tan(THREE.MathUtils.degToRad(BASE_FOV / 2)) * .8 / aspect)) : BASE_FOV;
+  camera.updateProjectionMatrix();
+  buildStatic(); drawOverlay();
+}
+
+const _cam = new THREE.Vector3();
+function renderAt(t) {
+  const sps = applyScene(t), sh = torrentFx(t).shake;
+  _cam.copy(camera.position);
+  if (sh > 0) { camera.position.x += sh * .045 * (Math.sin(t * 47) + Math.sin(t * 29)); camera.position.y += sh * .035 * Math.sin(t * 61 + 2); camera.lookAt(CAM_TARGET); }
+  renderer.render(scene, camera);
+  drawBackground(t, sps);
+  if (sh > 0) { camera.position.copy(_cam); camera.lookAt(CAM_TARGET); }
+}
+
+// ───────────────────────────────── sound (sfx/swig-sfx.js, the same synth make-audio.mjs puts in the videos)
+// Browsers only allow audio after a gesture, so it wakes on the first tap or the speaker button.
+// On touch screens only the *release* of a tap counts (pointerup / touchend), so pointerdown can't unlock it.
+function makeSound() {
+  const S = window.SwigSFX, btn = document.getElementById('sound');
+  if (!S || !window.AudioContext) { btn.hidden = true; return null; }
+  const VARIANTS = { pop: 3, torrent: 2 };   // same pick as make-audio.mjs: seed % count
+  const banked = S.renderBank(48000, VARIANTS);
+  let want = true, ctx = null, master = null, bank = null, pending = [];
+  try { want = localStorage.getItem('swig-sound') !== 'off'; } catch {}
+  const toBuffer = b => { const ab = new AudioBuffer({ length: b.n, numberOfChannels: 2, sampleRate: b.sr }); ab.copyToChannel(b.L, 0); ab.copyToChannel(b.R, 1); return ab; };
+  const running = () => ctx?.state === 'running';
+  const show = () => { const on = want && running(); btn.setAttribute('aria-pressed', on); btn.setAttribute('aria-label', on ? 'Sound on' : 'Sound off'); };
+  function open() {
+    if (ctx) { if (!running()) ctx.resume().catch(() => {}); return; }
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch {}   // iOS: play even with the ringer on silent
+    ctx = new AudioContext();
+    ctx.onstatechange = () => { show(); flush(); };
+    if (!running()) ctx.resume().catch(() => {});
+    master = new GainNode(ctx);
+    master.connect(new DynamicsCompressorNode(ctx, { threshold: -2, knee: 0, ratio: 20, attack: .002, release: .1 })).connect(ctx.destination);   // catches overlapping taps
+    banked.then(b => {
+      bank = { pop: b.pop.map(toBuffer), torrent: b.torrent.map(toBuffer) }; flush();
+      const bed = new AudioBufferSourceNode(ctx, { buffer: toBuffer(b.ambient), loop: true }), fade = new GainNode(ctx, { gain: 0 });
+      fade.gain.setTargetAtTime(1, ctx.currentTime, .8);
+      bed.connect(fade).connect(master); bed.start();
+    });
+  }
+  function set(on) {
+    want = on;
+    try { localStorage.setItem('swig-sound', on ? 'on' : 'off'); } catch {}
+    if (on) open(); else ctx?.suspend().catch(() => {});
+    show();
+  }
+  btn.addEventListener('click', () => set(!(want && running())));
+  for (const type of ['pointerup', 'touchend', 'keydown']) addEventListener(type, e => { if (want && !running() && !btn.contains(e.target)) open(); }, { passive: true });
+  document.addEventListener('visibilitychange', () => { if (ctx && want) (document.hidden ? ctx.suspend() : ctx.resume()).catch(() => {}); });
+  show();
+  const start = (e, late) => {
+    const list = bank[e.type], src = new AudioBufferSourceNode(ctx, { buffer: list[e.seed % list.length] });
+    src.connect(master); src.start(0, late);
+  };
+  // the tap that unlocks audio also launches a spurt whose sound is due before the finger lifts: hold it, then play it in sync
+  function flush() {
+    if (!bank || !running()) return;
+    const now = performance.now();
+    for (const p of pending) if (now - p.at < 1000) start(p.e, (now - p.at) / 1000);
+    pending = [];
+  }
+  return {
+    play(e, late) {
+      if (!want) return;
+      if (bank && running()) return start(e, late);
+      const now = performance.now();
+      pending = pending.filter(p => now - p.at < 1000).concat({ e, at: now - late * 1000 });
+    },
+  };
+}
+
+// ───────────────────────────────── boot
+async function boot() {
+  await Promise.all(['400 100px Pacifico', '500 40px "IBM Plex Mono"', '600 40px "IBM Plex Mono"', '600 20px "Instrument Sans"'].map(f => document.fonts.load(f)));
+  await document.fonts.ready;
+  buildCup();
+  resize();
+  renderAt(START); // warm up shaders
+}
+const ready = boot();
+
+if (CAPTURE) {
+  const out = canvas(1, 1), og = out.getContext('2d');
+  window.__ready = ready.then(() => true);
+  window.renderFrame = (t) => {
+    renderAt(t);
+    if (out.width !== W) { out.width = W; out.height = Hh; }
+    og.imageSmoothingQuality = 'high';
+    og.drawImage(bgCanvas, 0, 0, W, Hh); og.drawImage(glCanvas, 0, 0, W, Hh); og.drawImage(fxCanvas, 0, 0, W, Hh);
+    return out.toDataURL('image/png');
+  };
+} else {
+  const sound = makeSound();
+  ready.then(() => {
+    const t0 = performance.now(), cam = { x: 0, y: 0 }, ptr = { x: 0, y: 0 };
+    let lastTap = -9, seed = 5000;
+    const hint = document.getElementById('hint');
+    setTimeout(() => hint.classList.add('show'), 1800);
+    setTimeout(() => hint.classList.remove('show'), 7800);
+    const now = () => (performance.now() - t0) / 1000 + START;
+    addEventListener('resize', resize);
+    const stage = document.getElementById('stage'), ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+    const overCup = e => { ndc.set(e.clientX / W * 2 - 1, -(e.clientY / Hh) * 2 + 1); ray.setFromCamera(ndc, camera); return ray.intersectObjects(hitTargets, false).length > 0; };
+    addEventListener('pointermove', e => { ptr.x = e.clientX / W * 2 - 1; ptr.y = e.clientY / Hh * 2 - 1; stage.style.cursor = overCup(e) ? 'pointer' : 'default'; });
+    stage.addEventListener('pointerdown', e => {
+      const t = now();
+      if (overCup(e)) {   // the cup itself: open the floodgates (one torrent at a time)
+        if (extraSpurts.some(x => x.type === 'torrent' && t < x.s + TORRENT.dur + .4)) return;
+        extraSpurts.push({ s: t + TORRENT.anticipate, seed: seed++, type: 'torrent' });
+      } else {            // anywhere else: a regular pop
+        if (t - lastTap < .7) return; lastTap = t;
+        extraSpurts.push({ s: t + ANTICIPATE, seed: seed++, type: 'pop' });
+      }
+      if (extraSpurts.length > 8) extraSpurts.shift();
+      hint.classList.remove('show');
+    });
+    let lastT = now();
+    (function frame() {
+      const t = now();
+      cam.x += (ptr.x - cam.x) * .04; cam.y += (ptr.y - cam.y) * .04;
+      camera.position.set(CAM_POS.x + cam.x * 1.1, CAM_POS.y - cam.y * .6, CAM_POS.z); camera.lookAt(CAM_TARGET);
+      requestAnimationFrame(frame);
+      renderAt(t);
+      // each spurt's sound starts LEAD seconds early (the tap click, the eruption's rumble); skip any missed while the tab slept
+      if (sound) for (const e of eventsNear(t)) { const at = e.s - SwigSFX.LEAD[e.type]; if (at > lastT && at <= t && t - at < .25) sound.play(e, t - at); }
+      lastT = t;
+    })();
+  });
+}
+</script>
+</body>
+</html>
